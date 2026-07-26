@@ -13,6 +13,7 @@ from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .api.ble_packet import DIY_STYLE_NAMES
 from .const import (
@@ -24,6 +25,8 @@ from .const import (
     SUFFIX_DIY_STYLE_SELECT,
     SUFFIX_HDMI_SOURCE_SELECT,
     SUFFIX_HEATER_FAN_SPEED,
+    SUFFIX_ICE_MAKING_MODE_SELECT,
+    SUFFIX_ICE_SIZE_SELECT,
     SUFFIX_MUSIC_MODE_SELECT,
     SUFFIX_NIGHTLIGHT_SCENE_SELECT,
     SUFFIX_PRESET_SCENE_SELECT,
@@ -39,10 +42,12 @@ from .models import (
     MusicModeCommand,
     SceneCommand,
     SnapshotCommand,
+    ToggleCommand,
     WorkModeCommand,
 )
 from .models.device import (
     INSTANCE_HDMI_SOURCE,
+    INSTANCE_ICE_MAKING_TOGGLE,
     INSTANCE_NIGHTLIGHT_SCENE,
     INSTANCE_PRESET_SCENE,
     INSTANCE_PURIFIER_MODE,
@@ -236,6 +241,38 @@ async def async_setup_entry(
                     "Created preset scene select entity for %s with %d scenes",
                     device.name,
                     len(preset_scene_options),
+                )
+
+        # Ice maker cycle + size selectors (H8120).
+        if device.is_ice_maker:
+            ice_mode_options = device.get_ice_making_mode_options()
+            if ice_mode_options:
+                entities.append(
+                    GoveeIceMakingModeSelectEntity(
+                        coordinator=coordinator,
+                        device=device,
+                        options=ice_mode_options,
+                    )
+                )
+                _LOGGER.debug(
+                    "Created ice making mode select entity for %s with %d modes",
+                    device.name,
+                    len(ice_mode_options),
+                )
+
+            ice_size_options = device.get_ice_size_options()
+            if ice_size_options:
+                entities.append(
+                    GoveeIceSizeSelectEntity(
+                        coordinator=coordinator,
+                        device=device,
+                        options=ice_size_options,
+                    )
+                )
+                _LOGGER.debug(
+                    "Created ice size select entity for %s with %d sizes",
+                    device.name,
+                    len(ice_size_options),
                 )
 
         # Nightlight scene selector for appliances with a nightlight (H5089
@@ -1187,6 +1224,191 @@ class GoveePresetSceneSelectEntity(GoveeEntity, SelectEntity):
         else:
             _LOGGER.warning(
                 "Failed to set preset scene '%s' on %s",
+                option,
+                self._device.name,
+            )
+
+
+class GoveeIceMakingModeSelectEntity(GoveeEntity, SelectEntity, RestoreEntity):
+    """Ice maker cycle selector (H8120).
+
+    Govee models this as ``devices.capabilities.toggle`` named
+    ``iceMakingToggle``, but its ENUM is {"iceMaking": 0, "Clean": 1} — a
+    two-way choice of cycle, not an on/off switch. Exposing it as a switch
+    would make "on" mean "cleaning", so it is a select instead. Stopping the
+    unit is the power switch; the capability has no idle value.
+
+    The cycle polls back as "" so the selection is optimistic and restored
+    across restarts, but a live value is preferred if the cloud ever returns
+    one.
+    """
+
+    _attr_translation_key = "govee_ice_making_mode_select"
+    _attr_icon = "mdi:snowflake"
+
+    def __init__(
+        self,
+        coordinator: GoveeCoordinator,
+        device: GoveeDevice,
+        options: list[dict[str, Any]],
+    ) -> None:
+        """Initialize the ice making mode select entity.
+
+        Args:
+            coordinator: Govee data coordinator.
+            device: Device this select belongs to.
+            options: iceMakingToggle ENUM options from capability parameters.
+        """
+        super().__init__(coordinator, device)
+
+        self._option_map: dict[str, int] = {}
+        option_names: list[str] = []
+        for opt in options:
+            name = opt.get("name", "")
+            value = opt.get("value")
+            if name and value is not None:
+                self._option_map[name] = value
+                option_names.append(name)
+
+        self._attr_options = option_names
+        self._attr_unique_id = f"{device.device_id}{SUFFIX_ICE_MAKING_MODE_SELECT}"
+        self._selected: str | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the last selected cycle across restarts."""
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state and last_state.state in self._attr_options:
+            self._selected = last_state.state
+
+    @property
+    def current_option(self) -> str | None:
+        """Return the live cycle if reported, else the last selection."""
+        state = self.coordinator.get_state(self._device_id)
+        if state is not None:
+            live = state.toggles.get(INSTANCE_ICE_MAKING_TOGGLE)
+            if live is not None:
+                for name, value in self._option_map.items():
+                    if value == int(live):
+                        return name
+        return self._selected
+
+    async def async_select_option(self, option: str) -> None:
+        """Handle cycle selection."""
+        value = self._option_map.get(option)
+        if value is None:
+            _LOGGER.warning("Unknown ice making mode option: %s", option)
+            return
+
+        success = await self.coordinator.async_control_device(
+            self._device_id,
+            ToggleCommand(
+                toggle_instance=INSTANCE_ICE_MAKING_TOGGLE,
+                enabled=bool(value),
+            ),
+        )
+
+        if success:
+            self._selected = option
+            self.async_write_ha_state()
+            _LOGGER.debug(
+                "Set ice making mode '%s' (value=%d) on %s",
+                option,
+                value,
+                self._device.name,
+            )
+        else:
+            _LOGGER.warning(
+                "Failed to set ice making mode '%s' on %s",
+                option,
+                self._device.name,
+            )
+
+
+class GoveeIceSizeSelectEntity(GoveeEntity, SelectEntity, RestoreEntity):
+    """Ice cube size selector for ice makers (H8120).
+
+    Rides the same workMode STRUCT as the fan/heater speed selects, but the
+    ice maker's single workMode (IceMakingMode) nests the sizes under the
+    matching modeValue option. Govee returns "" for workMode on poll, so the
+    selection is optimistic and restored across restarts.
+    """
+
+    _attr_translation_key = "govee_ice_size_select"
+    _attr_icon = "mdi:cube-outline"
+
+    def __init__(
+        self,
+        coordinator: GoveeCoordinator,
+        device: GoveeDevice,
+        options: list[dict[str, Any]],
+    ) -> None:
+        """Initialize the ice size select entity.
+
+        Args:
+            coordinator: Govee data coordinator.
+            device: Device this select belongs to.
+            options: {"name", "work_mode", "mode_value"} dicts from the device.
+        """
+        super().__init__(coordinator, device)
+
+        self._option_map: dict[str, tuple[int, int]] = {}
+        option_names: list[str] = []
+        for opt in options:
+            name = opt.get("name", "")
+            work_mode = opt.get("work_mode")
+            mode_value = opt.get("mode_value")
+            if name and work_mode is not None and mode_value is not None:
+                self._option_map[name] = (work_mode, mode_value)
+                option_names.append(name)
+
+        self._attr_options = option_names
+        self._attr_unique_id = f"{device.device_id}{SUFFIX_ICE_SIZE_SELECT}"
+        self._selected: str | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the last selected size across restarts."""
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state and last_state.state in self._attr_options:
+            self._selected = last_state.state
+
+    @property
+    def current_option(self) -> str | None:
+        """Return the live size if reported, else the last selection."""
+        state = self.coordinator.get_state(self._device_id)
+        if state is not None and state.work_mode is not None:
+            for name, (work_mode, mode_value) in self._option_map.items():
+                if work_mode == state.work_mode and mode_value == state.mode_value:
+                    return name
+        return self._selected
+
+    async def async_select_option(self, option: str) -> None:
+        """Handle ice size selection."""
+        mapped = self._option_map.get(option)
+        if mapped is None:
+            _LOGGER.warning("Unknown ice size option: %s", option)
+            return
+
+        work_mode, mode_value = mapped
+        success = await self.coordinator.async_control_device(
+            self._device_id,
+            WorkModeCommand(work_mode=work_mode, mode_value=mode_value),
+        )
+
+        if success:
+            self._selected = option
+            self.async_write_ha_state()
+            _LOGGER.debug(
+                "Set ice size '%s' (workMode=%d, modeValue=%d) on %s",
+                option,
+                work_mode,
+                mode_value,
+                self._device.name,
+            )
+        else:
+            _LOGGER.warning(
+                "Failed to set ice size '%s' on %s",
                 option,
                 self._device.name,
             )

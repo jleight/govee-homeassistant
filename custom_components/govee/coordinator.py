@@ -106,9 +106,13 @@ from .models.commands import (
     create_dreamview_command,
 )
 from .models.device import (
+    INSTANCE_CLEANING_COMPLETED_EVENT,
     INSTANCE_DREAMVIEW,
     INSTANCE_HDMI_SOURCE,
     INSTANCE_HUMIDITY,
+    INSTANCE_ICE_FULL_EVENT,
+    INSTANCE_LACK_WATER_EVENT,
+    INSTANCE_RUN_INTERRUPT_EVENT,
     INSTANCE_THERMOSTAT_TOGGLE,
     MAINS_POWERED_BATTERY_SKUS,
     MAINS_POWERED_DEVICE_TYPES,
@@ -343,6 +347,10 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         self._last_rediscovery_check: float = time.monotonic()
         # Per-device queued button presses (supports multiple presses per tick)
         self._pending_button_presses: dict[str, int] = {}
+        # Per-device queued momentary capability events, keyed by device id and
+        # holding the capability instance names in arrival order (e.g. the ice
+        # maker's cleaningCompletedEvent / runInterruptEvent).
+        self._pending_device_events: dict[str, list[str]] = {}
         self._bff_poll_unsub: CALLBACK_TYPE | None = None
         self._bff_poll_task: asyncio.Task[None] | None = None
         # Standalone water-detector (H5054) leak polling (issue #62).
@@ -704,6 +712,21 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                 self._pending_button_presses[device_id] = count - 1
             return True
         return False
+
+    def consume_device_event(self, device_id: str, instance: str) -> bool:
+        """Consume one queued momentary event for device_id/instance.
+
+        Returns True if one was pending. Mirrors ``consume_button_press`` but
+        keyed by capability instance, since a device can expose several
+        momentary events (the H8120 has two).
+        """
+        queued = self._pending_device_events.get(device_id)
+        if not queued or instance not in queued:
+            return False
+        queued.remove(instance)
+        if not queued:
+            del self._pending_device_events[device_id]
+        return True
 
     def get_device(self, device_id: str) -> GoveeDevice | None:
         """Get device by ID."""
@@ -1443,6 +1466,37 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                 "Water tank full event for %s (%s): %s", device_id, sku, bool(value)
             )
             self.async_set_updated_data(self._states)
+            return
+
+        # Ice maker (H8120) status events. iceFull / lackWaterEvent are
+        # condition flags that map onto binary sensors; unlike waterFullEvent
+        # the ice maker does clear them (the bin empties, the tank is refilled),
+        # so no latch or manual-clear button is needed here.
+        if instance == INSTANCE_ICE_FULL_EVENT:
+            state = self._get_or_create_state(device_id)
+            state.ice_full = bool(value)
+            _LOGGER.info("Ice bin full event for %s (%s): %s", device_id, sku, bool(value))
+            self.async_set_updated_data(self._states)
+            return
+
+        # Scoped to ice makers on purpose: humidifiers (H7150) and aroma
+        # diffusers (H7161) also emit lackWaterEvent, and they have no entity
+        # consuming it — handling it for them would silently add a sensor to
+        # existing installs. Widen this when those SKUs get their own sensor.
+        if instance == INSTANCE_LACK_WATER_EVENT and device.is_ice_maker:
+            state = self._get_or_create_state(device_id)
+            state.lack_water = bool(value)
+            _LOGGER.info("Low water event for %s (%s): %s", device_id, sku, bool(value))
+            self.async_set_updated_data(self._states)
+            return
+
+        # cleaningCompletedEvent / runInterruptEvent are momentary notifications
+        # with no lingering condition to report, so they queue for the event
+        # platform to fire and are not held in device state.
+        if instance in (INSTANCE_CLEANING_COMPLETED_EVENT, INSTANCE_RUN_INTERRUPT_EVENT):
+            self._pending_device_events.setdefault(device_id, []).append(instance)
+            _LOGGER.info("Ice maker %s for %s (%s)", instance, device_id, sku)
+            async_dispatcher_send(self.hass, f"{DOMAIN}_device_event")
             return
 
         # bodyAppearedEvent fires for BOTH transitions on presence sensors:
@@ -2554,6 +2608,13 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                     state.battery = existing_state.battery
                 if existing_state.water_full is not None and state.water_full is None:
                     state.water_full = existing_state.water_full
+                # Ice maker status flags arrive only on the event push; the
+                # developer poll omits the event capabilities entirely, so
+                # without this they would flicker to "unknown" every poll.
+                if existing_state.ice_full is not None and state.ice_full is None:
+                    state.ice_full = existing_state.ice_full
+                if existing_state.lack_water is not None and state.lack_water is None:
+                    state.lack_water = existing_state.lack_water
                 # Occupancy (H5127) is a momentary push event; the developer
                 # /device/state poll returns only `online` for it (never the
                 # bodyAppearedEvent value), so the fresh state has presence=None.

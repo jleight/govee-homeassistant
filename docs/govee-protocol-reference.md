@@ -1850,7 +1850,7 @@ def detect_capabilities(device_response):
 | `devices.types.dehumidifier` | Dehumidifiers (H7151) |
 | `devices.types.heater` | Space heaters (H7130, H7131, H721C) |
 | `devices.types.fan` | Tower fans (H7101, H7107). NB: combo ceiling-fan-with-light units (H1310) report as `devices.types.light`, not `fan` |
-| `devices.types.ice_maker` | Ice makers (H7172) |
+| `devices.types.ice_maker` | Ice makers (H7172, H8120) |
 | `devices.types.thermometer` | Temp/humidity sensors (H5103, H5107, H5109, H5179) |
 | `devices.types.air_quality_monitor` | CO2/air quality monitors (H5140) |
 | `devices.types.sensor` | Motion, presence, water-leak sensors (H5059) |
@@ -2326,6 +2326,59 @@ Key observations:
 - Unique device type — ice maker
 - work_mode options represent ice sizes, not speed/modes
 - Two event capabilities for operational status
+
+#### H8120 — Nugget Ice Maker (`devices.types.ice_maker`)
+
+Confirmed from a user diagnostics dump. Richer than the H7172: adds a full
+nightlight sub-block and four event capabilities.
+
+```json
+{
+  "capabilities": [
+    {"type": "devices.capabilities.on_off", "instance": "powerSwitch"},
+    {"type": "devices.capabilities.toggle", "instance": "iceMakingToggle",
+     "parameters": {"dataType": "ENUM", "options": [
+       {"name": "iceMaking", "value": 0}, {"name": "Clean", "value": 1}
+     ]}},
+    {"type": "devices.capabilities.work_mode", "instance": "workMode",
+     "parameters": {"dataType": "STRUCT", "fields": [
+       {"fieldName": "workMode", "options": [{"name": "IceMakingMode", "value": 1}]},
+       {"fieldName": "modeValue", "options": [{"name": "IceMakingMode", "options": [
+         {"name": "Small Nugget", "value": 1}, {"name": "Medium Nugget", "value": 2},
+         {"name": "Large Nugget", "value": 3}
+       ]}]}
+     ]}},
+    {"type": "devices.capabilities.toggle", "instance": "precoolToggle"},
+    {"type": "devices.capabilities.toggle", "instance": "nightlightToggle"},
+    {"type": "devices.capabilities.range", "instance": "brightness"},
+    {"type": "devices.capabilities.color_setting", "instance": "colorRgb"},
+    {"type": "devices.capabilities.mode", "instance": "nightlightScene",
+     "parameters": {"options": ["Party", "Gathering", "...15 total"]}},
+    {"type": "devices.capabilities.event", "instance": "lackWaterEvent"},
+    {"type": "devices.capabilities.event", "instance": "iceFull"},
+    {"type": "devices.capabilities.event", "instance": "cleaningCompletedEvent"},
+    {"type": "devices.capabilities.event", "instance": "runInterruptEvent"}
+  ]
+}
+```
+
+Key observations:
+- **`iceMakingToggle` is not an on/off toggle** despite the capability type.
+  Its ENUM selects between the ice-making cycle (0) and the self-clean cycle
+  (1) — modeling it as a switch would make "on" mean "cleaning". There is no
+  third value, so pausing the unit is `powerSwitch` off. Exposed as a select.
+- The `modeValue` sizes nest under the matching `workMode` option name
+  (`IceMakingMode`), not under `gearMode` as on fans/purifiers.
+- `iceFull` breaks the naming convention — no `Event` suffix, unlike the other
+  three.
+- The nightlight's `colorRgb` is why this SKU needed an explicit `is_ice_maker`
+  exclusion in `is_light_device`: without it, the `supports_rgb` fallback made
+  the whole appliance a light entity whose on/off was the appliance mains.
+- Poll returns `""` for `iceMakingToggle`, `workMode`, `colorRgb`, and
+  `nightlightScene`, and omits all four event capabilities — the events arrive
+  only on the OpenAPI event channel.
+- `lackWaterEvent` is shared with humidifiers (H7150) and aroma diffusers
+  (H7161), so coordinator handling for it is scoped to ice makers.
 
 #### H5179 — WiFi Thermometer (`devices.types.thermometer`)
 

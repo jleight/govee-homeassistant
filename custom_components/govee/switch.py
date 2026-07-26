@@ -26,6 +26,7 @@ from .const import (
     SUFFIX_MUSIC_MODE,
     SUFFIX_NEBULA_LIGHT,
     SUFFIX_NIGHT_LIGHT,
+    SUFFIX_PRECOOL,
     SUFFIX_SIDE_LIGHT,
     SUFFIX_SOCKET,
 )
@@ -42,6 +43,7 @@ from .models import (
 from .models.device import (
     INSTANCE_BACKGROUND_LIGHT_TOGGLE,
     INSTANCE_MAIN_LIGHT_TOGGLE,
+    INSTANCE_PRECOOL_TOGGLE,
     INSTANCE_THERMOSTAT_TOGGLE,
 )
 
@@ -148,9 +150,20 @@ async def async_setup_entry(
         if (
             device.supports_power
             and not device.is_group
-            and (device.is_heater or device.is_kettle or device.is_aroma_diffuser)
+            and (
+                device.is_heater
+                or device.is_kettle
+                or device.is_aroma_diffuser
+                or device.is_ice_maker
+            )
         ):
             entities.append(GoveeAppliancePowerSwitchEntity(coordinator, device))
+
+        # Ice maker pre-cool toggle (H8120). Polls back as "" like the named
+        # light toggles, so it is optimistic + RestoreEntity.
+        if device.supports_precool and not device.is_group:
+            entities.append(GoveePrecoolSwitchEntity(coordinator, device))
+            _LOGGER.debug("Created pre-cool switch entity for %s", device.name)
 
         # Create switch for DreamView (Movie Mode) toggle
         # Skip for group devices - groups don't support DreamView
@@ -512,6 +525,57 @@ class GoveeNamedLightSwitchEntity(GoveeEntity, SwitchEntity, RestoreEntity):
         if success:
             self._is_on = False
             self.async_write_ha_state()
+
+
+class GoveePrecoolSwitchEntity(GoveeEntity, SwitchEntity, RestoreEntity):
+    """Pre-cool toggle for ice makers (H8120).
+
+    Pre-cool chills the reservoir before the first ice cycle. Govee returns ""
+    for ``precoolToggle`` on poll, so state is optimistic and restored across
+    restarts, the same approach as the named light toggles.
+    """
+
+    _attr_translation_key = "govee_precool"
+    _attr_icon = "mdi:snowflake-thermometer"
+
+    def __init__(
+        self,
+        coordinator: GoveeCoordinator,
+        device: GoveeDevice,
+    ) -> None:
+        """Initialize the pre-cool switch entity."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}{SUFFIX_PRECOOL}"
+        self._is_on = False
+
+    async def async_added_to_hass(self) -> None:
+        """Restore optimistic state on startup."""
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state:
+            self._is_on = last_state.state == "on"
+
+    @property
+    def is_on(self) -> bool:
+        """Return True if pre-cool is engaged (optimistic)."""
+        return self._is_on
+
+    async def _set(self, enabled: bool) -> None:
+        success = await self.coordinator.async_control_device(
+            self._device_id,
+            ToggleCommand(toggle_instance=INSTANCE_PRECOOL_TOGGLE, enabled=enabled),
+        )
+        if success:
+            self._is_on = enabled
+            self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Engage pre-cool."""
+        await self._set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Disengage pre-cool."""
+        await self._set(False)
 
 
 class GoveeMusicModeSwitchEntity(GoveeEntity, SwitchEntity):

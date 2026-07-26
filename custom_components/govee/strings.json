@@ -157,6 +157,12 @@
       },
       "govee_nightlight_scene_select": {
         "name": "Night Light Scene"
+      },
+      "govee_ice_making_mode_select": {
+        "name": "Cycle"
+      },
+      "govee_ice_size_select": {
+        "name": "Ice Size"
       }
     },
     "switch": {
@@ -198,6 +204,9 @@
       },
       "govee_bottom_light": {
         "name": "Bottom Light"
+      },
+      "govee_precool": {
+        "name": "Pre-cool"
       }
     },
     "sensor": {
@@ -280,6 +289,12 @@
       },
       "leak_hub_online": {
         "name": "Internet"
+      },
+      "govee_ice_full": {
+        "name": "Ice Bin Full"
+      },
+      "govee_lack_water": {
+        "name": "Water Low"
       }
     },
     "fan": {
@@ -330,6 +345,26 @@
           "event_type": {
             "state": {
               "press": "Press"
+            }
+          }
+        }
+      },
+      "govee_cleaning_completed": {
+        "name": "Cleaning Completed",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "cleaning_completed": "Cleaning completed"
+            }
+          }
+        }
+      },
+      "govee_run_interrupt": {
+        "name": "Run Interrupted",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "run_interrupted": "Run interrupted"
             }
           }
         }

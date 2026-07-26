@@ -35,6 +35,8 @@ from .const import (
     CONF_EXPOSE_TRANSPORT_ENTITIES,
     DEFAULT_EXPOSE_TRANSPORT_ENTITIES,
     DOMAIN,
+    SUFFIX_ICE_FULL,
+    SUFFIX_LACK_WATER,
 )
 from .coordinator import GoveeCoordinator
 from .entity import GoveeEntity
@@ -83,6 +85,18 @@ async def async_setup_entry(
         # options, so they were previously mis-created as moisture sensors.
         if device.supports_presence_event:
             entities.append(GoveeOccupancyBinarySensor(coordinator, device))
+        # Ice maker status flags (H8120). Unlike the dehumidifier's latching
+        # waterFullEvent, these clear themselves when the bin is emptied or the
+        # reservoir refilled, so they are plain condition sensors.
+        # Gated on is_ice_maker, not the capability alone: humidifiers and
+        # aroma diffusers also declare lackWaterEvent, and the coordinator only
+        # feeds the state for ice makers, so a capability-only check would give
+        # them a permanently-unknown sensor.
+        if device.is_ice_maker:
+            if device.supports_ice_full_event:
+                entities.append(GoveeIceFullBinarySensor(coordinator, device))
+            if device.supports_lack_water_event:
+                entities.append(GoveeLackWaterBinarySensor(coordinator, device))
         # Overall per-device connectivity (one entity, always exposed) — carries
         # the full per-transport last-received / last-sent breakdown as
         # attributes. The granular per-transport entities below stay opt-in.
@@ -182,6 +196,56 @@ class GoveeWaterFullBinarySensor(GoveeEntity, BinarySensorEntity, RestoreEntity)
         if changed is not None:
             attrs["changed_at"] = changed.isoformat()
         return attrs
+
+
+class GoveeIceFullBinarySensor(GoveeEntity, BinarySensorEntity):
+    """Binary sensor reporting the ice-bin-full condition on ice makers (H8120).
+
+    Not a PROBLEM device class — a full bin is the goal, not a fault. The unit
+    pauses production until ice is removed, at which point Govee pushes the
+    cleared event.
+    """
+
+    _attr_translation_key = "govee_ice_full"
+    _attr_icon = "mdi:snowflake-alert"
+
+    def __init__(
+        self,
+        coordinator: GoveeCoordinator,
+        device: Any,
+    ) -> None:
+        """Initialize the ice-full binary sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}{SUFFIX_ICE_FULL}"
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True when the ice bin is full."""
+        state = self.device_state
+        return state.ice_full if state else None
+
+
+class GoveeLackWaterBinarySensor(GoveeEntity, BinarySensorEntity):
+    """Binary sensor reporting an empty reservoir on ice makers (H8120)."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_translation_key = "govee_lack_water"
+    _attr_icon = "mdi:water-alert"
+
+    def __init__(
+        self,
+        coordinator: GoveeCoordinator,
+        device: Any,
+    ) -> None:
+        """Initialize the low-water binary sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}{SUFFIX_LACK_WATER}"
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True when the reservoir needs refilling."""
+        state = self.device_state
+        return state.lack_water if state else None
 
 
 class GoveeWaterLeakBinarySensor(GoveeEntity, BinarySensorEntity):

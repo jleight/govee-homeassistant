@@ -236,6 +236,12 @@ class GoveeDeviceState:
     # H7150 — see GoveeDevice.auto_mode_value_is_setpoint.
     configured_humidity: int | None = None
 
+    # Ice maker (H8120) event flags. Both arrive via the OpenAPI event push —
+    # the developer-API device-state poll returns neither — so they are
+    # preserved across polls like water_full.
+    ice_full: bool | None = None  # Ice bin full; the unit stops making ice
+    lack_water: bool | None = None  # Reservoir empty
+
     # Standalone water-leak detector trip (H5054, issue #62). True when water
     # is detected. Arrives via the bodyAppearedEvent event capability — the
     # developer-API device-state poll only returns `online`, so the trip
@@ -419,6 +425,18 @@ class GoveeDeviceState:
                         self.water_full = bool(value.get("state") or value.get("value"))
                     elif value is not None:
                         self.water_full = bool(value)
+                elif instance == "iceFull":
+                    # Ice maker bin-full (H8120). Same shape as waterFullEvent.
+                    if isinstance(value, dict):
+                        self.ice_full = bool(value.get("state") or value.get("value"))
+                    elif value is not None:
+                        self.ice_full = bool(value)
+                elif instance == "lackWaterEvent":
+                    # Ice maker reservoir empty (H8120).
+                    if isinstance(value, dict):
+                        self.lack_water = bool(value.get("state") or value.get("value"))
+                    elif value is not None:
+                        self.lack_water = bool(value)
                 elif instance == "bodyAppearedEvent":
                     # H5054 water-leak detector trip (issue #62).
                     if isinstance(value, dict):

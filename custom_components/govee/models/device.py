@@ -74,6 +74,7 @@ DEVICE_TYPE_KETTLE = "devices.types.kettle"
 DEVICE_TYPE_AROMA_DIFFUSER = "devices.types.aroma_diffuser"
 DEVICE_TYPE_SENSOR = "devices.types.sensor"
 DEVICE_TYPE_AIR_QUALITY_MONITOR = "devices.types.air_quality_monitor"
+DEVICE_TYPE_ICE_MAKER = "devices.types.ice_maker"
 
 # Device types that are always mains-powered. Some of them still report a
 # bogus, constant ``battery`` in the BFF ``deviceSettings`` (e.g. the H5106
@@ -92,6 +93,7 @@ MAINS_POWERED_DEVICE_TYPES = frozenset(
         DEVICE_TYPE_KETTLE,
         DEVICE_TYPE_AROMA_DIFFUSER,
         DEVICE_TYPE_AIR_QUALITY_MONITOR,
+        DEVICE_TYPE_ICE_MAKER,
     }
 )
 
@@ -148,6 +150,18 @@ INSTANCE_PRESET_SCENE = "presetScene"
 INSTANCE_THERMOSTAT_TOGGLE = "thermostatToggle"
 INSTANCE_HUMIDITY = "humidity"
 INSTANCE_WATER_FULL_EVENT = "waterFullEvent"
+# Ice maker (H8120) instances. ``iceMakingToggle`` is a toggle in name only —
+# its ENUM is {"iceMaking": 0, "Clean": 1}, i.e. a two-way mode selector between
+# the ice-making cycle and the self-clean cycle, NOT on/off. Pausing the unit is
+# ``powerSwitch`` off; the capability has no third value.
+INSTANCE_ICE_MAKING_TOGGLE = "iceMakingToggle"
+INSTANCE_PRECOOL_TOGGLE = "precoolToggle"
+# Ice maker events. Note Govee names this one ``iceFull``, without the
+# ``Event`` suffix the other three carry.
+INSTANCE_ICE_FULL_EVENT = "iceFull"
+INSTANCE_LACK_WATER_EVENT = "lackWaterEvent"
+INSTANCE_CLEANING_COMPLETED_EVENT = "cleaningCompletedEvent"
+INSTANCE_RUN_INTERRUPT_EVENT = "runInterruptEvent"
 # Standalone water-leak detectors (H5054) surface their trip via the generic
 # bodyAppearedEvent event instance — the only event capability Govee's
 # developer API exposes for these SKUs (issue #62). Unlike the H5058 leak
@@ -563,6 +577,115 @@ class GoveeDevice:
     def is_dehumidifier(self) -> bool:
         """Check if device is specifically a dehumidifier."""
         return self.device_type == DEVICE_TYPE_DEHUMIDIFIER
+
+    @property
+    def is_ice_maker(self) -> bool:
+        """Check if device is an ice maker (e.g. H8120, H7172)."""
+        return self.device_type == DEVICE_TYPE_ICE_MAKER
+
+    @property
+    def supports_ice_making_toggle(self) -> bool:
+        """Check if device exposes the ice-making / clean mode selector."""
+        return any(
+            cap.type == CAPABILITY_TOGGLE
+            and cap.instance == INSTANCE_ICE_MAKING_TOGGLE
+            for cap in self.capabilities
+        )
+
+    @property
+    def supports_precool(self) -> bool:
+        """Check if device exposes the pre-cool toggle (H8120)."""
+        return any(
+            cap.type == CAPABILITY_TOGGLE and cap.instance == INSTANCE_PRECOOL_TOGGLE
+            for cap in self.capabilities
+        )
+
+    def has_event_capability(self, instance: str) -> bool:
+        """Whether the device exposes the given event capability instance."""
+        return any(
+            cap.type == CAPABILITY_EVENT and cap.instance == instance
+            for cap in self.capabilities
+        )
+
+    @property
+    def supports_ice_full_event(self) -> bool:
+        """Check if device exposes the ice-bin-full event capability."""
+        return any(
+            cap.type == CAPABILITY_EVENT and cap.instance == INSTANCE_ICE_FULL_EVENT
+            for cap in self.capabilities
+        )
+
+    @property
+    def supports_lack_water_event(self) -> bool:
+        """Check if device exposes the low-water event capability."""
+        return any(
+            cap.type == CAPABILITY_EVENT and cap.instance == INSTANCE_LACK_WATER_EVENT
+            for cap in self.capabilities
+        )
+
+    def get_ice_making_mode_options(self) -> list[dict[str, Any]]:
+        """Extract the iceMakingToggle ENUM options as {"name", "value"} dicts.
+
+        Returned verbatim from the capability so a firmware that adds a third
+        value surfaces it without a code change.
+        """
+        for cap in self.capabilities:
+            if (
+                cap.type == CAPABILITY_TOGGLE
+                and cap.instance == INSTANCE_ICE_MAKING_TOGGLE
+            ):
+                options: list[dict[str, Any]] = cap.parameters.get("options", [])
+                return options
+        return []
+
+    def get_ice_size_options(self) -> list[dict[str, Any]]:
+        """Extract ice-size options from the workMode capability (H8120).
+
+        The ice maker reuses the fan/heater workMode STRUCT shape, but its
+        single ``workMode`` option (IceMakingMode=1) nests the sizes under the
+        matching ``modeValue`` option rather than under ``gearMode``.
+
+        Returns list of {"name": "Small Nugget", "work_mode": 1, "mode_value": 1}.
+        """
+        for cap in self.capabilities:
+            if cap.type == CAPABILITY_WORK_MODE and cap.instance == INSTANCE_WORK_MODE:
+                work_mode_field: dict[str, Any] | None = None
+                mode_value_field: dict[str, Any] | None = None
+                for f in cap.parameters.get("fields", []):
+                    if f.get("fieldName") == "workMode":
+                        work_mode_field = f
+                    elif f.get("fieldName") == "modeValue":
+                        mode_value_field = f
+
+                if not work_mode_field or not mode_value_field:
+                    return []
+
+                # modeValue options are keyed by the workMode option's name.
+                mv_lookup: dict[str, list[dict[str, Any]]] = {}
+                for mv_opt in mode_value_field.get("options", []):
+                    mv_name = mv_opt.get("name", "")
+                    if mv_name:
+                        mv_lookup[mv_name] = mv_opt.get("options", [])
+
+                result: list[dict[str, Any]] = []
+                for wm_opt in work_mode_field.get("options", []):
+                    wm_name = wm_opt.get("name", "")
+                    wm_value = wm_opt.get("value")
+                    if wm_value is None:
+                        continue
+                    for size in mv_lookup.get(wm_name, []):
+                        size_name = size.get("name", "")
+                        size_value = size.get("value")
+                        if size_name and size_value is not None:
+                            result.append(
+                                {
+                                    "name": size_name,
+                                    "work_mode": wm_value,
+                                    "mode_value": size_value,
+                                }
+                            )
+                return result
+        return []
 
     @property
     def supports_water_full_event(self) -> bool:
@@ -1052,6 +1175,12 @@ class GoveeDevice:
         excluded when it has no color capability. Plain plugs (on/off only)
         stay switch-only. Fixes #59 — the #54 appliance filter over-reached
         and removed the H5089's color light entity.
+
+        Appliance types are excluded up front because several of them carry a
+        decorative nightlight whose ``colorRgb`` would otherwise satisfy the
+        ``supports_rgb`` fallback below and turn the whole appliance into a
+        light — e.g. the H8120 ice maker, whose light entity's on/off was the
+        appliance mains, so "turn off all the lights" cut power to it.
         """
         if (
             self.is_fan
@@ -1060,6 +1189,7 @@ class GoveeDevice:
             or self.is_humidifier
             or self.is_kettle
             or self.is_aroma_diffuser
+            or self.is_ice_maker
         ):
             return False
         # An outlet extender whose colour belongs to a nightlight (it also
